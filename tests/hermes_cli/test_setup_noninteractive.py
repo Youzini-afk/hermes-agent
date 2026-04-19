@@ -83,6 +83,26 @@ class TestNonInteractiveSetup:
         out = capsys.readouterr().out
         assert "hermes config set model.provider custom" in out
 
+    def test_chat_first_run_cloud_runtime_skips_setup_prompt_even_with_tty(self):
+        """Managed cloud runtime should fail fast instead of prompting for setup."""
+        from hermes_cli.main import cmd_chat
+
+        args = _make_chat_args()
+
+        with (
+            patch("hermes_cli.main._has_any_provider_configured", return_value=False),
+            patch("hermes_cli.main.cmd_setup") as mock_setup,
+            patch("sys.stdin") as mock_stdin,
+            patch("builtins.input", side_effect=AssertionError("input should not be called")),
+            patch.dict("os.environ", {"HERMES_DEPLOY_TARGET": "zeabur"}, clear=False),
+        ):
+            mock_stdin.isatty.return_value = True
+            with pytest.raises(SystemExit) as exc:
+                cmd_chat(args)
+
+        assert exc.value.code == 1
+        mock_setup.assert_not_called()
+
     def test_no_tty_skips_wizard(self, capsys):
         """When stdin has no TTY, the setup wizard should print guidance and return."""
         from hermes_cli.setup import run_setup_wizard

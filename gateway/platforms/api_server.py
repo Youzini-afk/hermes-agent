@@ -34,17 +34,27 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 try:
-    from aiohttp import web
+    from aiohttp import ClientSession, ClientTimeout, web
     AIOHTTP_AVAILABLE = True
 except ImportError:
     AIOHTTP_AVAILABLE = False
     web = None  # type: ignore[assignment]
+    ClientSession = None  # type: ignore[assignment]
+    ClientTimeout = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
     SendResult,
     is_network_accessible,
+)
+from hermes_cli.runtime_env import (
+    internal_dashboard_port,
+    is_zeabur_runtime,
+    public_port,
+    zeabur_auto_api_server,
+    zeabur_single_service_webui,
+    zeabur_web_url,
 )
 
 logger = logging.getLogger(__name__)
@@ -57,6 +67,19 @@ MAX_REQUEST_BYTES = 1_000_000  # 1 MB default limit for POST bodies
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+
+_PROXY_HOP_BY_HOP_HEADERS = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "host",
+    "content-length",
+}
 
 
 def _normalize_chat_content(
@@ -377,11 +400,14 @@ class APIServerAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.API_SERVER)
         extra = config.extra or {}
-        self._host: str = extra.get("host", os.getenv("API_SERVER_HOST", DEFAULT_HOST))
-        self._port: int = int(extra.get("port", os.getenv("API_SERVER_PORT", str(DEFAULT_PORT))))
+        runtime_port = public_port() if zeabur_auto_api_server() else None
+        runtime_host = "0.0.0.0" if runtime_port is not None else DEFAULT_HOST
+        runtime_origin = zeabur_web_url() if runtime_port is not None else ""
+        self._host: str = extra.get("host", os.getenv("API_SERVER_HOST", runtime_host))
+        self._port: int = int(extra.get("port", os.getenv("API_SERVER_PORT", str(runtime_port or DEFAULT_PORT))))
         self._api_key: str = extra.get("key", os.getenv("API_SERVER_KEY", ""))
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
-            extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
+            extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", runtime_origin)),
         )
         self._model_name: str = self._resolve_model_name(
             extra.get("model_name", os.getenv("API_SERVER_MODEL_NAME", "")),
@@ -395,6 +421,15 @@ class APIServerAdapter(BasePlatformAdapter):
         # Creation timestamps for orphaned-run TTL sweep
         self._run_streams_created: Dict[str, float] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        self._dashboard_proxy_enabled: bool = (
+            is_zeabur_runtime()
+            and zeabur_auto_api_server()
+            and zeabur_single_service_webui()
+            and public_port() is not None
+        )
+        self._dashboard_sidecar = None
+        self._dashboard_upstream_url: str = ""
+        self._dashboard_proxy_timeout = ClientTimeout(total=120) if AIOHTTP_AVAILABLE else None
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -845,7 +880,10 @@ class APIServerAdapter(BasePlatformAdapter):
 
         If the client disconnects mid-stream (network drop, browser tab close),
         the agent is interrupted via ``agent.interrupt()`` so it stops making
-        LLM API calls, and the asyncio task wrapper is cancelled.
+        LLM API calls, then the asyncio task wrapper is cancelled.  When
+        ``store=True`` the full response is persisted to the ResponseStore in
+        a ``finally`` block so GET /v1/responses/{id} and ``previous_response_id``
+        chaining work the same as the batch path.
         """
         import queue as _q
 
@@ -854,8 +892,6 @@ class APIServerAdapter(BasePlatformAdapter):
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
         }
-        # CORS middleware can't inject headers into StreamResponse after
-        # prepare() flushes them, so resolve CORS headers up front.
         origin = request.headers.get("Origin", "")
         cors = self._cors_headers_for_origin(origin) if origin else None
         if cors:
@@ -969,427 +1005,6 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return response
 
-    async def _write_sse_responses(
-        self,
-        request: "web.Request",
-        response_id: str,
-        model: str,
-        created_at: int,
-        stream_q,
-        agent_task,
-        agent_ref,
-        conversation_history: List[Dict[str, str]],
-        user_message: str,
-        instructions: Optional[str],
-        conversation: Optional[str],
-        store: bool,
-        session_id: str,
-    ) -> "web.StreamResponse":
-        """Write an SSE stream for POST /v1/responses (OpenAI Responses API).
-
-        Emits spec-compliant event types as the agent runs:
-
-        - ``response.created`` — initial envelope (status=in_progress)
-        - ``response.output_text.delta`` / ``response.output_text.done`` —
-          streamed assistant text
-        - ``response.output_item.added`` / ``response.output_item.done``
-          with ``item.type == "function_call"`` — when the agent invokes a
-          tool (both events fire; the ``done`` event carries the finalized
-          ``arguments`` string)
-        - ``response.output_item.added`` with
-          ``item.type == "function_call_output"`` — tool result with
-          ``{call_id, output, status}``
-        - ``response.completed`` — terminal event carrying the full
-          response object with all output items + usage (same payload
-          shape as the non-streaming path for parity)
-        - ``response.failed`` — terminal event on agent error
-
-        If the client disconnects mid-stream, ``agent.interrupt()`` is
-        called so the agent stops issuing upstream LLM calls, then the
-        asyncio task is cancelled.  When ``store=True`` the full response
-        is persisted to the ResponseStore in a ``finally`` block so GET
-        /v1/responses/{id} and ``previous_response_id`` chaining work the
-        same as the batch path.
-        """
-        import queue as _q
-
-        sse_headers = {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        }
-        origin = request.headers.get("Origin", "")
-        cors = self._cors_headers_for_origin(origin) if origin else None
-        if cors:
-            sse_headers.update(cors)
-        if session_id:
-            sse_headers["X-Hermes-Session-Id"] = session_id
-        response = web.StreamResponse(status=200, headers=sse_headers)
-        await response.prepare(request)
-
-        # State accumulated during the stream
-        final_text_parts: List[str] = []
-        # Track open function_call items by name so we can emit a matching
-        # ``done`` event when the tool completes.  Order preserved.
-        pending_tool_calls: List[Dict[str, Any]] = []
-        # Output items we've emitted so far (used to build the terminal
-        # response.completed payload).  Kept in the order they appeared.
-        emitted_items: List[Dict[str, Any]] = []
-        # Monotonic counter for output_index (spec requires it).
-        output_index = 0
-        # Monotonic counter for call_id generation if the agent doesn't
-        # provide one (it doesn't, from tool_progress_callback).
-        call_counter = 0
-        # Canonical Responses SSE events include a monotonically increasing
-        # sequence_number. Add it server-side for every emitted event so
-        # clients that validate the OpenAI event schema can parse our stream.
-        sequence_number = 0
-        # Track the assistant message item id + content index for text
-        # delta events — the spec ties deltas to a specific item.
-        message_item_id = f"msg_{uuid.uuid4().hex[:24]}"
-        message_output_index: Optional[int] = None
-        message_opened = False
-
-        async def _write_event(event_type: str, data: Dict[str, Any]) -> None:
-            nonlocal sequence_number
-            if "sequence_number" not in data:
-                data["sequence_number"] = sequence_number
-            sequence_number += 1
-            payload = f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
-            await response.write(payload.encode())
-
-        def _envelope(status: str) -> Dict[str, Any]:
-            env: Dict[str, Any] = {
-                "id": response_id,
-                "object": "response",
-                "status": status,
-                "created_at": created_at,
-                "model": model,
-            }
-            return env
-
-        final_response_text = ""
-        agent_error: Optional[str] = None
-        usage: Dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-
-        try:
-            # response.created — initial envelope, status=in_progress
-            created_env = _envelope("in_progress")
-            created_env["output"] = []
-            await _write_event("response.created", {
-                "type": "response.created",
-                "response": created_env,
-            })
-            last_activity = time.monotonic()
-
-            async def _open_message_item() -> None:
-                """Emit response.output_item.added for the assistant message
-                the first time any text delta arrives."""
-                nonlocal message_opened, message_output_index, output_index
-                if message_opened:
-                    return
-                message_opened = True
-                message_output_index = output_index
-                output_index += 1
-                item = {
-                    "id": message_item_id,
-                    "type": "message",
-                    "status": "in_progress",
-                    "role": "assistant",
-                    "content": [],
-                }
-                await _write_event("response.output_item.added", {
-                    "type": "response.output_item.added",
-                    "output_index": message_output_index,
-                    "item": item,
-                })
-
-            async def _emit_text_delta(delta_text: str) -> None:
-                await _open_message_item()
-                final_text_parts.append(delta_text)
-                await _write_event("response.output_text.delta", {
-                    "type": "response.output_text.delta",
-                    "item_id": message_item_id,
-                    "output_index": message_output_index,
-                    "content_index": 0,
-                    "delta": delta_text,
-                    "logprobs": [],
-                })
-
-            async def _emit_tool_started(payload: Dict[str, Any]) -> str:
-                """Emit response.output_item.added for a function_call.
-
-                Returns the call_id so the matching completion event can
-                reference it.  Prefer the real ``tool_call_id`` from the
-                agent when available; fall back to a generated call id for
-                safety in tests or older code paths.
-                """
-                nonlocal output_index, call_counter
-                call_counter += 1
-                call_id = payload.get("tool_call_id") or f"call_{response_id[5:]}_{call_counter}"
-                args = payload.get("arguments", {})
-                if isinstance(args, dict):
-                    arguments_str = json.dumps(args)
-                else:
-                    arguments_str = str(args)
-                item = {
-                    "id": f"fc_{uuid.uuid4().hex[:24]}",
-                    "type": "function_call",
-                    "status": "in_progress",
-                    "name": payload.get("name", ""),
-                    "call_id": call_id,
-                    "arguments": arguments_str,
-                }
-                idx = output_index
-                output_index += 1
-                pending_tool_calls.append({
-                    "call_id": call_id,
-                    "name": payload.get("name", ""),
-                    "arguments": arguments_str,
-                    "item_id": item["id"],
-                    "output_index": idx,
-                })
-                emitted_items.append({
-                    "type": "function_call",
-                    "name": payload.get("name", ""),
-                    "arguments": arguments_str,
-                    "call_id": call_id,
-                })
-                await _write_event("response.output_item.added", {
-                    "type": "response.output_item.added",
-                    "output_index": idx,
-                    "item": item,
-                })
-                return call_id
-
-            async def _emit_tool_completed(payload: Dict[str, Any]) -> None:
-                """Emit response.output_item.done (function_call) followed
-                by response.output_item.added (function_call_output)."""
-                nonlocal output_index
-                call_id = payload.get("tool_call_id")
-                result = payload.get("result", "")
-                pending = None
-                if call_id:
-                    for i, p in enumerate(pending_tool_calls):
-                        if p["call_id"] == call_id:
-                            pending = pending_tool_calls.pop(i)
-                            break
-                if pending is None:
-                    # Completion without a matching start — skip to avoid
-                    # emitting orphaned done events.
-                    return
-
-                # function_call done
-                done_item = {
-                    "id": pending["item_id"],
-                    "type": "function_call",
-                    "status": "completed",
-                    "name": pending["name"],
-                    "call_id": pending["call_id"],
-                    "arguments": pending["arguments"],
-                }
-                await _write_event("response.output_item.done", {
-                    "type": "response.output_item.done",
-                    "output_index": pending["output_index"],
-                    "item": done_item,
-                })
-
-                # function_call_output added (result)
-                result_str = result if isinstance(result, str) else json.dumps(result)
-                output_parts = [{"type": "input_text", "text": result_str}]
-                output_item = {
-                    "id": f"fco_{uuid.uuid4().hex[:24]}",
-                    "type": "function_call_output",
-                    "call_id": pending["call_id"],
-                    "output": output_parts,
-                    "status": "completed",
-                }
-                idx = output_index
-                output_index += 1
-                emitted_items.append({
-                    "type": "function_call_output",
-                    "call_id": pending["call_id"],
-                    "output": output_parts,
-                })
-                await _write_event("response.output_item.added", {
-                    "type": "response.output_item.added",
-                    "output_index": idx,
-                    "item": output_item,
-                })
-                await _write_event("response.output_item.done", {
-                    "type": "response.output_item.done",
-                    "output_index": idx,
-                    "item": output_item,
-                })
-
-            # Main drain loop — thread-safe queue fed by agent callbacks.
-            async def _dispatch(it) -> None:
-                """Route a queue item to the correct SSE emitter.
-
-                Plain strings are text deltas.  Tagged tuples with
-                ``__tool_started__`` / ``__tool_completed__`` prefixes
-                are tool lifecycle events.
-                """
-                if isinstance(it, tuple) and len(it) == 2 and isinstance(it[0], str):
-                    tag, payload = it
-                    if tag == "__tool_started__":
-                        await _emit_tool_started(payload)
-                    elif tag == "__tool_completed__":
-                        await _emit_tool_completed(payload)
-                    # Unknown tags are silently ignored (forward-compat).
-                elif isinstance(it, str):
-                    await _emit_text_delta(it)
-                # Other types (non-string, non-tuple) are silently dropped.
-
-            loop = asyncio.get_running_loop()
-            while True:
-                try:
-                    item = await loop.run_in_executor(None, lambda: stream_q.get(timeout=0.5))
-                except _q.Empty:
-                    if agent_task.done():
-                        # Drain remaining
-                        while True:
-                            try:
-                                item = stream_q.get_nowait()
-                                if item is None:
-                                    break
-                                await _dispatch(item)
-                                last_activity = time.monotonic()
-                            except _q.Empty:
-                                break
-                        break
-                    if time.monotonic() - last_activity >= CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS:
-                        await response.write(b": keepalive\n\n")
-                        last_activity = time.monotonic()
-                    continue
-
-                if item is None:  # EOS sentinel
-                    break
-
-                await _dispatch(item)
-                last_activity = time.monotonic()
-
-            # Pick up agent result + usage from the completed task
-            try:
-                result, agent_usage = await agent_task
-                usage = agent_usage or usage
-                # If the agent produced a final_response but no text
-                # deltas were streamed (e.g. some providers only emit
-                # the full response at the end), emit a single fallback
-                # delta so Responses clients still receive a live text part.
-                agent_final = result.get("final_response", "") if isinstance(result, dict) else ""
-                if agent_final and not final_text_parts:
-                    await _emit_text_delta(agent_final)
-                if agent_final and not final_response_text:
-                    final_response_text = agent_final
-                if isinstance(result, dict) and result.get("error") and not final_response_text:
-                    agent_error = result["error"]
-            except Exception as e:  # noqa: BLE001
-                logger.error("Error running agent for streaming responses: %s", e, exc_info=True)
-                agent_error = str(e)
-
-            # Close the message item if it was opened
-            final_response_text = "".join(final_text_parts) or final_response_text
-            if message_opened:
-                await _write_event("response.output_text.done", {
-                    "type": "response.output_text.done",
-                    "item_id": message_item_id,
-                    "output_index": message_output_index,
-                    "content_index": 0,
-                    "text": final_response_text,
-                    "logprobs": [],
-                })
-                msg_done_item = {
-                    "id": message_item_id,
-                    "type": "message",
-                    "status": "completed",
-                    "role": "assistant",
-                    "content": [
-                        {"type": "output_text", "text": final_response_text}
-                    ],
-                }
-                await _write_event("response.output_item.done", {
-                    "type": "response.output_item.done",
-                    "output_index": message_output_index,
-                    "item": msg_done_item,
-                })
-
-            # Always append a final message item in the completed
-            # response envelope so clients that only parse the terminal
-            # payload still see the assistant text.  This mirrors the
-            # shape produced by _extract_output_items in the batch path.
-            final_items: List[Dict[str, Any]] = list(emitted_items)
-            final_items.append({
-                "type": "message",
-                "role": "assistant",
-                "content": [
-                    {"type": "output_text", "text": final_response_text or (agent_error or "")}
-                ],
-            })
-
-            if agent_error:
-                failed_env = _envelope("failed")
-                failed_env["output"] = final_items
-                failed_env["error"] = {"message": agent_error, "type": "server_error"}
-                failed_env["usage"] = {
-                    "input_tokens": usage.get("input_tokens", 0),
-                    "output_tokens": usage.get("output_tokens", 0),
-                    "total_tokens": usage.get("total_tokens", 0),
-                }
-                await _write_event("response.failed", {
-                    "type": "response.failed",
-                    "response": failed_env,
-                })
-            else:
-                completed_env = _envelope("completed")
-                completed_env["output"] = final_items
-                completed_env["usage"] = {
-                    "input_tokens": usage.get("input_tokens", 0),
-                    "output_tokens": usage.get("output_tokens", 0),
-                    "total_tokens": usage.get("total_tokens", 0),
-                }
-                await _write_event("response.completed", {
-                    "type": "response.completed",
-                    "response": completed_env,
-                })
-
-                # Persist for future chaining / GET retrieval, mirroring
-                # the batch path behavior.
-                if store:
-                    full_history = list(conversation_history)
-                    full_history.append({"role": "user", "content": user_message})
-                    if isinstance(result, dict) and result.get("messages"):
-                        full_history.extend(result["messages"])
-                    else:
-                        full_history.append({"role": "assistant", "content": final_response_text})
-                    self._response_store.put(response_id, {
-                        "response": completed_env,
-                        "conversation_history": full_history,
-                        "instructions": instructions,
-                        "session_id": session_id,
-                    })
-                    if conversation:
-                        self._response_store.set_conversation(conversation, response_id)
-
-        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
-            # Client disconnected — interrupt the agent so it stops
-            # making upstream LLM calls, then cancel the task.
-            agent = agent_ref[0] if agent_ref else None
-            if agent is not None:
-                try:
-                    agent.interrupt("SSE client disconnected")
-                except Exception:
-                    pass
-            if not agent_task.done():
-                agent_task.cancel()
-                try:
-                    await agent_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-            logger.info("SSE client disconnected; interrupted agent task %s", response_id)
-
-        return response
-
     async def _handle_responses(self, request: "web.Request") -> "web.Response":
         """POST /v1/responses — OpenAI Responses API format."""
         auth_err = self._check_auth(request)
@@ -1417,11 +1032,6 @@ class APIServerAdapter(BasePlatformAdapter):
         # conversation and previous_response_id are mutually exclusive
         if conversation and previous_response_id:
             return web.json_response(_openai_error("Cannot use both 'conversation' and 'previous_response_id'"), status=400)
-
-        # Resolve conversation name to latest response_id
-        if conversation:
-            previous_response_id = self._response_store.get_conversation(conversation)
-            # No error if conversation doesn't exist yet — it's a new conversation
 
         # Normalize input to message list
         input_messages: List[Dict[str, str]] = []
@@ -2299,6 +1909,112 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._run_streams.pop(run_id, None)
                 self._run_streams_created.pop(run_id, None)
 
+    @staticmethod
+    def _filter_proxy_headers(headers) -> Dict[str, str]:
+        return {
+            k: v
+            for k, v in headers.items()
+            if k.lower() not in _PROXY_HOP_BY_HOP_HEADERS
+        }
+
+    def _dashboard_upstream(self, request: "web.Request") -> str:
+        return f"{self._dashboard_upstream_url}{request.rel_url.path_qs}"
+
+    def _start_dashboard_sidecar(self) -> bool:
+        if not self._dashboard_proxy_enabled:
+            return True
+
+        try:
+            from hermes_cli.web_server import WEB_DIST, start_server_background
+        except SystemExit as exc:
+            logger.error(
+                "[%s] Zeabur single-service WebUI requested but dashboard dependencies are missing: %s",
+                self.name,
+                exc,
+            )
+            return False
+        except Exception as exc:
+            logger.error("[%s] Failed to import dashboard sidecar: %s", self.name, exc)
+            return False
+
+        if not WEB_DIST.exists():
+            logger.error(
+                "[%s] Zeabur single-service WebUI requested but frontend dist was not found at %s. "
+                "Build it with: cd web && npm install && npm run build",
+                self.name,
+                WEB_DIST,
+            )
+            return False
+
+        try:
+            handle = start_server_background(
+                host="127.0.0.1",
+                port=internal_dashboard_port(),
+                open_browser=False,
+                allow_public=False,
+                respect_runtime_defaults=False,
+            )
+        except Exception as exc:
+            logger.error("[%s] Failed to start dashboard sidecar: %s", self.name, exc)
+            return False
+
+        self._dashboard_sidecar = handle
+        self._dashboard_upstream_url = f"http://127.0.0.1:{handle.port}"
+        logger.info(
+            "[%s] Zeabur single-service WebUI proxy enabled (dashboard sidecar: %s)",
+            self.name,
+            self._dashboard_upstream_url,
+        )
+        return True
+
+    def _stop_dashboard_sidecar(self) -> None:
+        handle = self._dashboard_sidecar
+        self._dashboard_sidecar = None
+        self._dashboard_upstream_url = ""
+        if not handle:
+            return
+        try:
+            handle.stop(timeout=5.0)
+        except Exception as exc:
+            logger.debug("[%s] Failed to stop dashboard sidecar cleanly: %s", self.name, exc)
+
+    async def _proxy_dashboard_request(self, request: "web.Request") -> "web.Response":
+        if not self._dashboard_upstream_url:
+            return web.json_response({"error": "Dashboard proxy unavailable"}, status=503)
+
+        if not AIOHTTP_AVAILABLE or ClientSession is None:
+            return web.json_response({"error": "aiohttp unavailable"}, status=503)
+
+        upstream_url = self._dashboard_upstream(request)
+        headers = {
+            k: v
+            for k, v in request.headers.items()
+            if k.lower() not in _PROXY_HOP_BY_HOP_HEADERS
+        }
+        headers.setdefault("X-Forwarded-Host", request.host)
+        headers.setdefault("X-Forwarded-Proto", "https" if request.secure else "http")
+
+        payload = await request.read()
+        timeout = self._dashboard_proxy_timeout or ClientTimeout(total=120)
+        try:
+            async with ClientSession(timeout=timeout) as session:
+                async with session.request(
+                    request.method,
+                    upstream_url,
+                    data=payload if payload else None,
+                    headers=headers,
+                    allow_redirects=False,
+                ) as resp:
+                    body = b"" if request.method == "HEAD" else await resp.read()
+                    return web.Response(
+                        status=resp.status,
+                        body=body,
+                        headers=self._filter_proxy_headers(resp.headers),
+                    )
+        except Exception as exc:
+            logger.warning("[%s] Dashboard proxy error for %s: %s", self.name, request.path_qs, exc)
+            return web.json_response({"error": "Dashboard unavailable"}, status=502)
+
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface
     # ------------------------------------------------------------------
@@ -2344,10 +2060,16 @@ class APIServerAdapter(BasePlatformAdapter):
 
             # Refuse to start network-accessible without authentication
             if is_network_accessible(self._host) and not self._api_key:
+                runtime_port = public_port() if zeabur_auto_api_server() else None
+                detail = " Set API_SERVER_KEY or use the default 127.0.0.1."
+                if runtime_port is not None and self._port == runtime_port:
+                    detail = (
+                        f" Zeabur single-service mode detected PORT={runtime_port}."
+                        " Set API_SERVER_KEY or disable HERMES_ZEABUR_AUTO_API_SERVER."
+                    )
                 logger.error(
-                    "[%s] Refusing to start: binding to %s requires API_SERVER_KEY. "
-                    "Set API_SERVER_KEY or use the default 127.0.0.1.",
-                    self.name, self._host,
+                    "[%s] Refusing to start: binding to %s requires API_SERVER_KEY.%s",
+                    self.name, self._host, detail,
                 )
                 return False
 
@@ -2378,6 +2100,14 @@ class APIServerAdapter(BasePlatformAdapter):
             except (ConnectionRefusedError, OSError):
                 pass  # port is free
 
+            if self._dashboard_proxy_enabled:
+                if not self._start_dashboard_sidecar():
+                    self._stop_dashboard_sidecar()
+                    return False
+                self._app.router.add_route("*", "/api/{tail:.*}", self._proxy_dashboard_request)
+                self._app.router.add_get("/", self._proxy_dashboard_request)
+                self._app.router.add_get("/{tail:.*}", self._proxy_dashboard_request)
+
             self._runner = web.AppRunner(self._app)
             await self._runner.setup()
             self._site = web.TCPSite(self._runner, self._host, self._port)
@@ -2396,9 +2126,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 "[%s] API server listening on http://%s:%d (model: %s)",
                 self.name, self._host, self._port, self._model_name,
             )
+            if self._dashboard_proxy_enabled:
+                logger.info(
+                    "[%s] WebUI available on API server root (proxied to %s)",
+                    self.name,
+                    self._dashboard_upstream_url,
+                )
             return True
 
         except Exception as e:
+            self._stop_dashboard_sidecar()
             logger.error("[%s] Failed to start API server: %s", self.name, e)
             return False
 
@@ -2411,6 +2148,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
+        self._stop_dashboard_sidecar()
         self._app = None
         logger.info("[%s] API server stopped", self.name)
 

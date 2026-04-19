@@ -45,6 +45,7 @@ from hermes_cli.config import (
     check_config_version,
     redact_key,
 )
+from hermes_cli.runtime_env import is_zeabur_runtime, public_port
 from gateway.status import get_running_pid, read_runtime_status
 
 try:
@@ -1395,7 +1396,7 @@ async def _start_device_code_flow(provider_id: str) -> Dict[str, Any]:
             "poll_interval": int(s.get("interval") or 5),
         }
 
-    raise HTTPException(status_code=400, detail=f"Provider {provider_id} does not support device-code flow")
+    raise HTTPException(status_code=400, detail="Unsupported flow")
 
 
 def _nous_poller(session_id: str) -> None:
@@ -2171,8 +2172,7 @@ def _discover_dashboard_plugins() -> list:
                     "_dir": str(child / "dashboard"),
                     "_api_file": data.get("api"),
                 })
-            except Exception as exc:
-                _log.warning("Bad dashboard plugin manifest %s: %s", manifest_file, exc)
+            except Exception:
                 continue
     return plugins
 
@@ -2283,16 +2283,19 @@ _mount_plugin_api_routes()
 mount_spa(app)
 
 
-def start_server(
-    host: str = "127.0.0.1",
-    port: int = 9119,
-    open_browser: bool = True,
-    allow_public: bool = False,
-):
-    """Start the web UI server."""
-    import uvicorn
+_LOCALHOST = ("127.0.0.1", "localhost", "::1")
 
-    _LOCALHOST = ("127.0.0.1", "localhost", "::1")
+
+def _resolve_runtime_bind(host: str, port: int, open_browser: bool) -> tuple[str, int, bool]:
+    runtime_port = public_port() if is_zeabur_runtime() else None
+    if runtime_port is not None and port == 9119:
+        port = runtime_port
+    if runtime_port is not None:
+        open_browser = False
+    return host, port, open_browser
+
+
+def _validate_bind_host(host: str, allow_public: bool) -> None:
     if host not in _LOCALHOST and not allow_public:
         raise SystemExit(
             f"Refusing to bind to {host} — the dashboard exposes API keys "
@@ -2304,6 +2307,76 @@ def start_server(
             "Binding to %s with --insecure — the dashboard has no robust "
             "authentication. Only use on trusted networks.", host,
         )
+
+
+class BackgroundWebServerHandle:
+    def __init__(self, server, thread: threading.Thread, host: str, port: int):
+        self._server = server
+        self._thread = thread
+        self.host = host
+        self.port = port
+
+    def stop(self, timeout: float = 5.0) -> None:
+        self._server.should_exit = True
+        self._thread.join(timeout=timeout)
+
+
+def start_server_background(
+    host: str = "127.0.0.1",
+    port: int = 9119,
+    open_browser: bool = False,
+    allow_public: bool = False,
+    respect_runtime_defaults: bool = True,
+) -> BackgroundWebServerHandle:
+    """Start the dashboard in a daemon thread and return a stop handle."""
+    import uvicorn
+
+    if respect_runtime_defaults:
+        host, port, open_browser = _resolve_runtime_bind(host, port, open_browser)
+    _validate_bind_host(host, allow_public)
+
+    if open_browser:
+        import webbrowser
+
+        def _open():
+            import time as _t
+            _t.sleep(1.0)
+            webbrowser.open(f"http://{host}:{port}")
+
+        threading.Thread(target=_open, daemon=True).start()
+
+    config = uvicorn.Config(app, host=host, port=port, log_level="warning")
+    server = uvicorn.Server(config)
+    thread = threading.Thread(
+        target=server.run,
+        daemon=True,
+        name=f"hermes-web-ui:{port}",
+    )
+    thread.start()
+
+    deadline = time.time() + 10.0
+    while not getattr(server, "started", False):
+        if not thread.is_alive():
+            raise RuntimeError("Dashboard server thread exited before startup")
+        if time.time() >= deadline:
+            raise RuntimeError("Dashboard server did not become ready within 10s")
+        time.sleep(0.05)
+
+    _log.info("Dashboard sidecar listening on http://%s:%d", host, port)
+    return BackgroundWebServerHandle(server=server, thread=thread, host=host, port=port)
+
+
+def start_server(
+    host: str = "127.0.0.1",
+    port: int = 9119,
+    open_browser: bool = True,
+    allow_public: bool = False,
+):
+    """Start the web UI server."""
+    import uvicorn
+
+    host, port, open_browser = _resolve_runtime_bind(host, port, open_browser)
+    _validate_bind_host(host, allow_public)
 
     if open_browser:
         import threading

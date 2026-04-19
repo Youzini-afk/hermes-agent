@@ -17,6 +17,7 @@ from typing import Dict, List, Optional, Any
 from enum import Enum
 
 from hermes_cli.config import get_hermes_home
+from hermes_cli.runtime_env import public_port, zeabur_auto_api_server, zeabur_web_url
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -1020,12 +1021,17 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         )
 
     # API Server
-    api_server_enabled = os.getenv("API_SERVER_ENABLED", "").lower() in ("true", "1", "yes")
+    api_server_enabled_raw = os.getenv("API_SERVER_ENABLED", "").strip().lower()
+    api_server_enabled = api_server_enabled_raw in ("true", "1", "yes")
+    api_server_disabled = api_server_enabled_raw in ("false", "0", "no", "off")
     api_server_key = os.getenv("API_SERVER_KEY", "")
     api_server_cors_origins = os.getenv("API_SERVER_CORS_ORIGINS", "")
     api_server_port = os.getenv("API_SERVER_PORT")
     api_server_host = os.getenv("API_SERVER_HOST")
-    if api_server_enabled or api_server_key:
+    runtime_port = public_port()
+    auto_api_server = zeabur_auto_api_server() and not api_server_disabled and runtime_port is not None
+    runtime_origin = zeabur_web_url() if auto_api_server else ""
+    if api_server_enabled or api_server_key or auto_api_server:
         if Platform.API_SERVER not in config.platforms:
             config.platforms[Platform.API_SERVER] = PlatformConfig()
         config.platforms[Platform.API_SERVER].enabled = True
@@ -1035,13 +1041,19 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             origins = [origin.strip() for origin in api_server_cors_origins.split(",") if origin.strip()]
             if origins:
                 config.platforms[Platform.API_SERVER].extra["cors_origins"] = origins
+        elif runtime_origin and "cors_origins" not in config.platforms[Platform.API_SERVER].extra:
+            config.platforms[Platform.API_SERVER].extra["cors_origins"] = [runtime_origin]
         if api_server_port:
             try:
                 config.platforms[Platform.API_SERVER].extra["port"] = int(api_server_port)
             except ValueError:
                 pass
+        elif auto_api_server and runtime_port is not None:
+            config.platforms[Platform.API_SERVER].extra["port"] = runtime_port
         if api_server_host:
             config.platforms[Platform.API_SERVER].extra["host"] = api_server_host
+        elif auto_api_server:
+            config.platforms[Platform.API_SERVER].extra["host"] = "0.0.0.0"
         api_server_model_name = os.getenv("API_SERVER_MODEL_NAME", "")
         if api_server_model_name:
             config.platforms[Platform.API_SERVER].extra["model_name"] = api_server_model_name

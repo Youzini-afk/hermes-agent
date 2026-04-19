@@ -149,6 +149,37 @@ class TestAdapterInit:
             "http://127.0.0.1:3000",
         )
 
+    def test_config_from_zeabur_runtime(self, monkeypatch):
+        monkeypatch.setenv("HERMES_DEPLOY_TARGET", "zeabur")
+        monkeypatch.setenv("PORT", "8080")
+        monkeypatch.setenv("API_SERVER_KEY", "sk-zeabur")
+        monkeypatch.setenv("ZEABUR_WEB_URL", "https://hermes.example")
+        config = PlatformConfig(enabled=True)
+        adapter = APIServerAdapter(config)
+        assert adapter._host == "0.0.0.0"
+        assert adapter._port == 8080
+        assert adapter._api_key == "sk-zeabur"
+        assert adapter._cors_origins == ("https://hermes.example",)
+        assert adapter._dashboard_proxy_enabled is True
+
+    def test_zeabur_dashboard_proxy_can_be_disabled(self, monkeypatch):
+        monkeypatch.setenv("HERMES_DEPLOY_TARGET", "zeabur")
+        monkeypatch.setenv("PORT", "8080")
+        monkeypatch.setenv("HERMES_ZEABUR_SINGLE_SERVICE_WEBUI", "false")
+        config = PlatformConfig(enabled=True)
+        adapter = APIServerAdapter(config)
+        assert adapter._dashboard_proxy_enabled is False
+
+    def test_explicit_env_wins_over_zeabur_defaults(self, monkeypatch):
+        monkeypatch.setenv("HERMES_DEPLOY_TARGET", "zeabur")
+        monkeypatch.setenv("PORT", "8080")
+        monkeypatch.setenv("API_SERVER_HOST", "10.0.0.1")
+        monkeypatch.setenv("API_SERVER_PORT", "7777")
+        config = PlatformConfig(enabled=True)
+        adapter = APIServerAdapter(config)
+        assert adapter._host == "10.0.0.1"
+        assert adapter._port == 7777
+
 
 # ---------------------------------------------------------------------------
 # Auth checking

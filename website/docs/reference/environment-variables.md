@@ -342,6 +342,11 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 | `API_SERVER_PORT` | Port for the API server (default: `8642`) |
 | `API_SERVER_HOST` | Host/bind address for the API server (default: `127.0.0.1`). Use `0.0.0.0` for network access — requires `API_SERVER_KEY` and a narrow `API_SERVER_CORS_ORIGINS` allowlist. |
 | `API_SERVER_MODEL_NAME` | Model name advertised on `/v1/models`. Defaults to the profile name (or `hermes-agent` for the default profile). Useful for multi-user setups where frontends like Open WebUI need distinct model names per connection. |
+| `HERMES_DEPLOY_TARGET` | Deployment runtime target. Set to `zeabur` to enable Zeabur-specific runtime defaults. |
+| `HERMES_ZEABUR_AUTO_API_SERVER` | In Zeabur runtime, auto-enable API server and map to platform `PORT` (`true`/`false`, default: `true`). |
+| `HERMES_ZEABUR_SINGLE_SERVICE_WEBUI` | In Zeabur runtime, expose dashboard WebUI and API on the same public API server port (`true`/`false`, default: `true`). |
+| `HERMES_INTERNAL_DASHBOARD_PORT` | Loopback-only dashboard sidecar port used by single-service proxy mode (default: auto-pick free port). |
+| `HERMES_NONINTERACTIVE` | Force non-interactive runtime behavior (skip prompts that require `input()`), useful for CI/cloud deploys (`true`/`false`). |
 | `GATEWAY_PROXY_URL` | URL of a remote Hermes API server to forward messages to ([proxy mode](/docs/user-guide/messaging/matrix#proxy-mode-e2ee-on-macos)). When set, the gateway handles platform I/O only — all agent work is delegated to the remote server. Also configurable via `gateway.proxy_url` in `config.yaml`. |
 | `GATEWAY_PROXY_KEY` | Bearer token for authenticating with the remote API server in proxy mode. Must match `API_SERVER_KEY` on the remote host. |
 | `MESSAGING_CWD` | Working directory for terminal commands in messaging mode (default: `~`) |

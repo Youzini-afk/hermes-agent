@@ -180,6 +180,7 @@ import time as _time
 from datetime import datetime
 
 from hermes_cli import __version__, __release_date__
+from hermes_cli.runtime_env import is_noninteractive_runtime
 from hermes_constants import OPENROUTER_BASE_URL
 
 logger = logging.getLogger(__name__)
@@ -1057,6 +1058,12 @@ def cmd_chat(args):
             is_interactive_stdin,
             print_noninteractive_setup_guidance,
         )
+
+        if is_noninteractive_runtime():
+            print_noninteractive_setup_guidance(
+                "Non-interactive runtime detected; skipping setup prompt."
+            )
+            sys.exit(1)
 
         if not is_interactive_stdin():
             print_noninteractive_setup_guidance(
