@@ -1827,6 +1827,16 @@ class TestCORS:
             assert resp.headers.get("Access-Control-Allow-Origin") is None
 
     @pytest.mark.asyncio
+    async def test_same_origin_browser_request_allowed_without_cors_headers(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            base = cli.make_url("/")
+            origin = f"{base.scheme}://{base.host}:{base.port}"
+            resp = await cli.get("/health", headers={"Origin": origin})
+            assert resp.status == 200
+            assert resp.headers.get("Access-Control-Allow-Origin") is None
+
+    @pytest.mark.asyncio
     async def test_cors_headers_present_for_allowed_origin(self):
         """Allowed origins receive explicit CORS headers."""
         adapter = _make_adapter(cors_origins=["http://localhost:3000"])
@@ -1881,7 +1891,6 @@ class TestCORS:
             assert resp.headers.get("Access-Control-Allow-Origin") == "http://localhost:3000"
             assert "Authorization" in resp.headers.get("Access-Control-Allow-Headers", "")
 
-
     @pytest.mark.asyncio
     async def test_cors_preflight_sets_max_age(self):
         adapter = _make_adapter(cors_origins=["http://localhost:3000"])
@@ -1897,6 +1906,103 @@ class TestCORS:
             )
             assert resp.status == 200
             assert resp.headers.get("Access-Control-Max-Age") == "600"
+
+
+class TestDashboardProxyRoutes:
+    @pytest.mark.asyncio
+    async def test_zeabur_dashboard_proxy_forwards_post_login(self, monkeypatch):
+        monkeypatch.setenv("HERMES_DEPLOY_TARGET", "zeabur")
+        monkeypatch.setenv("PORT", "8080")
+        monkeypatch.setenv("API_SERVER_KEY", "sk-zeabur")
+        monkeypatch.setenv("ZEABUR_WEB_URL", "https://hermes.example")
+
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+
+        proxied = {}
+
+        class _FakeSocket:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def settimeout(self, timeout):
+                return None
+
+            def connect(self, address):
+                raise ConnectionRefusedError()
+
+        class _FakeSidecarHandle:
+            port = 9456
+
+            def stop(self, timeout=5.0):
+                return None
+
+        class _FakeProxyResponse:
+            def __init__(self):
+                self.status = 303
+                self.headers = {"Location": "/"}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def read(self):
+                return b""
+
+        class _FakeClientSession:
+            def __init__(self, *args, **kwargs):
+                return None
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def request(self, method, url, data=None, headers=None, allow_redirects=False):
+                proxied.update({
+                    "method": method,
+                    "url": url,
+                    "data": data,
+                    "headers": headers,
+                    "allow_redirects": allow_redirects,
+                })
+                return _FakeProxyResponse()
+
+        def _fake_start_dashboard_sidecar() -> bool:
+            adapter._dashboard_sidecar = _FakeSidecarHandle()
+            adapter._dashboard_upstream_url = "http://127.0.0.1:9456"
+            return True
+
+        mock_runner = AsyncMock()
+        mock_site = AsyncMock()
+
+        with (
+            patch("gateway.platforms.api_server.web.AppRunner", return_value=mock_runner),
+            patch("gateway.platforms.api_server.web.TCPSite", return_value=mock_site),
+            patch("gateway.platforms.api_server.ClientSession", _FakeClientSession),
+            patch("gateway.platforms.api_server._socket.socket", return_value=_FakeSocket()),
+            patch.object(adapter, "_start_dashboard_sidecar", side_effect=_fake_start_dashboard_sidecar),
+        ):
+            assert await adapter.connect() is True
+            async with TestClient(TestServer(adapter._app)) as cli:
+                resp = await cli.post(
+                    "/login",
+                    data={"password": "secret-login-pass", "next": "/"},
+                    headers={"Origin": "https://hermes.example"},
+                    allow_redirects=False,
+                )
+                assert resp.status == 303
+                assert proxied["method"] == "POST"
+                assert proxied["url"] == "http://127.0.0.1:9456/login"
+                assert proxied["allow_redirects"] is False
+            await adapter.disconnect()
+
+
 # ---------------------------------------------------------------------------
 # Conversation parameter
 # ---------------------------------------------------------------------------

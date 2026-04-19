@@ -31,6 +31,7 @@ import re
 import sqlite3
 import time
 import uuid
+from urllib.parse import urlsplit
 from typing import Any, Dict, List, Optional
 
 try:
@@ -262,6 +263,37 @@ _CORS_HEADERS = {
 }
 
 
+def _normalized_origin(value: str) -> str:
+    candidate = (value or "").strip()
+    if not candidate:
+        return ""
+    try:
+        parsed = urlsplit(candidate)
+    except ValueError:
+        return ""
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+
+
+def _request_origin(request) -> str:
+    forwarded_proto = request.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip().lower()
+    forwarded_host = request.headers.get("X-Forwarded-Host", "").split(",", 1)[0].strip().lower()
+    scheme = forwarded_proto or str(getattr(request, "scheme", "") or "").strip().lower()
+    host = forwarded_host or str(getattr(request, "host", "") or "").strip().lower()
+    if not scheme or not host:
+        return ""
+    return f"{scheme}://{host}"
+
+
+def _is_same_origin_request(request, origin: str) -> bool:
+    candidate = _normalized_origin(origin)
+    expected = _request_origin(request)
+    if not candidate or not expected:
+        return False
+    return hmac.compare_digest(candidate.encode("utf-8"), expected.encode("utf-8"))
+
+
 if AIOHTTP_AVAILABLE:
     @web.middleware
     async def cors_middleware(request, handler):
@@ -269,10 +301,12 @@ if AIOHTTP_AVAILABLE:
         adapter = request.app.get("api_server_adapter")
         origin = request.headers.get("Origin", "")
         cors_headers = None
+        same_origin = _is_same_origin_request(request, origin)
         if adapter is not None:
-            if not adapter._origin_allowed(origin):
+            if not same_origin and not adapter._origin_allowed(origin):
                 return web.Response(status=403)
-            cors_headers = adapter._cors_headers_for_origin(origin)
+            if not same_origin:
+                cors_headers = adapter._cors_headers_for_origin(origin)
 
         if request.method == "OPTIONS":
             if cors_headers is None:
@@ -2105,8 +2139,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     self._stop_dashboard_sidecar()
                     return False
                 self._app.router.add_route("*", "/api/{tail:.*}", self._proxy_dashboard_request)
-                self._app.router.add_get("/", self._proxy_dashboard_request)
-                self._app.router.add_get("/{tail:.*}", self._proxy_dashboard_request)
+                self._app.router.add_route("*", "/", self._proxy_dashboard_request)
+                self._app.router.add_route("*", "/{tail:.*}", self._proxy_dashboard_request)
 
             self._runner = web.AppRunner(self._app)
             await self._runner.setup()
