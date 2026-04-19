@@ -10,7 +10,10 @@ Usage:
 """
 
 import asyncio
+import base64
 import hmac
+import hashlib
+import html
 import importlib.util
 import json
 import logging
@@ -51,7 +54,7 @@ from gateway.status import get_running_pid, read_runtime_status
 try:
     from fastapi import FastAPI, HTTPException, Request
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
     from fastapi.staticfiles import StaticFiles
     from pydantic import BaseModel
 except ImportError:
@@ -71,6 +74,9 @@ app = FastAPI(title="Hermes Agent", version=__version__)
 # Injected into the SPA HTML so only the legitimate web UI can use it.
 # ---------------------------------------------------------------------------
 _SESSION_TOKEN = secrets.token_urlsafe(32)
+_WEBUI_AUTH_COOKIE = "hermes_webui_session"
+_WEBUI_AUTH_TTL_SECONDS = 60 * 60 * 12
+_WEBUI_AUTH_SIGNING_KEY = secrets.token_bytes(32)
 
 # Simple rate limiter for the reveal endpoint
 _reveal_timestamps: List[float] = []
@@ -102,6 +108,206 @@ _PUBLIC_API_PATHS: frozenset = frozenset({
     "/api/dashboard/plugins",
     "/api/dashboard/plugins/rescan",
 })
+_AUTH_FREE_PATHS: frozenset = frozenset({
+    "/login",
+    "/logout",
+})
+
+
+def _webui_password() -> str:
+    return os.getenv("HERMES_WEBUI_PASSWORD", "").strip()
+
+
+def _webui_auth_enabled() -> bool:
+    return bool(_webui_password())
+
+
+def _password_fingerprint(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()[:16]
+
+
+def _safe_redirect_target(raw: str) -> str:
+    candidate = (raw or "").strip()
+    if not candidate:
+        return "/"
+    parsed = urllib.parse.urlparse(candidate)
+    if parsed.scheme or parsed.netloc:
+        return "/"
+    path = parsed.path or "/"
+    if not path.startswith("/") or path.startswith("//"):
+        return "/"
+    target = path
+    if parsed.query:
+        target = f"{target}?{parsed.query}"
+    if parsed.fragment:
+        target = f"{target}#{parsed.fragment}"
+    if path in _AUTH_FREE_PATHS:
+        return "/"
+    return target
+
+
+def _make_webui_session(password: str) -> str:
+    payload = {
+        "exp": int(time.time()) + _WEBUI_AUTH_TTL_SECONDS,
+        "pwd": _password_fingerprint(password),
+    }
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    body = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    sig = hmac.new(_WEBUI_AUTH_SIGNING_KEY, body.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{body}.{sig}"
+
+
+def _read_webui_session(token: str) -> Optional[Dict[str, Any]]:
+    try:
+        body, sig = token.split(".", 1)
+    except ValueError:
+        return None
+    expected = hmac.new(_WEBUI_AUTH_SIGNING_KEY, body.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig, expected):
+        return None
+    padded = body + "=" * (-len(body) % 4)
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _is_webui_authenticated(request: Request) -> bool:
+    if not _webui_auth_enabled():
+        return True
+    password = _webui_password()
+    if not password:
+        return False
+    token = request.cookies.get(_WEBUI_AUTH_COOKIE, "")
+    if not token:
+        return False
+    payload = _read_webui_session(token)
+    if not payload:
+        return False
+    expires_at = payload.get("exp")
+    fingerprint = payload.get("pwd")
+    if not isinstance(expires_at, int) or expires_at <= int(time.time()):
+        return False
+    return isinstance(fingerprint, str) and hmac.compare_digest(
+        fingerprint,
+        _password_fingerprint(password),
+    )
+
+
+def _build_login_url(request: Request) -> str:
+    current = request.url.path
+    if request.url.query:
+        current = f"{current}?{request.url.query}"
+    target = urllib.parse.quote(_safe_redirect_target(current), safe="")
+    return f"/login?next={target}"
+
+
+def _login_required_response(request: Request):
+    if request.url.path.startswith("/api/"):
+        return JSONResponse(status_code=401, content={"detail": "Login required"})
+    return RedirectResponse(url=_build_login_url(request), status_code=303)
+
+
+def _login_page(next_path: str, error: str = "", status_code: int = 200) -> HTMLResponse:
+    safe_next = html.escape(_safe_redirect_target(next_path), quote=True)
+    error_block = ""
+    if error:
+        safe_error = html.escape(error)
+        error_block = (
+            '<div style="margin-bottom:16px;padding:12px 14px;border:1px solid rgba(239,68,68,.35);'
+            'background:rgba(127,29,29,.25);color:#fecaca;border-radius:12px;font-size:14px;">'
+            f"{safe_error}</div>"
+        )
+    return HTMLResponse(
+        f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Hermes Agent Login</title>
+    <style>
+      :root {{ color-scheme: dark; }}
+      * {{ box-sizing: border-box; }}
+      body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; background: radial-gradient(circle at top, rgba(120,119,198,.18), transparent 35%), #09090b; color: #fafafa; font-family: Inter, system-ui, sans-serif; }}
+      .shell {{ width: min(420px, calc(100vw - 32px)); padding: 28px; border: 1px solid rgba(255,255,255,.09); border-radius: 20px; background: rgba(24,24,27,.92); box-shadow: 0 24px 80px rgba(0,0,0,.45); }}
+      .eyebrow {{ margin: 0 0 8px; color: #a1a1aa; font-size: 11px; font-weight: 700; letter-spacing: .24em; text-transform: uppercase; }}
+      h1 {{ margin: 0 0 8px; font-size: 28px; letter-spacing: -.02em; }}
+      p {{ margin: 0 0 22px; color: #a1a1aa; font-size: 14px; line-height: 1.6; }}
+      label {{ display: block; margin-bottom: 8px; font-size: 13px; color: #d4d4d8; }}
+      input {{ width: 100%; padding: 13px 14px; border-radius: 12px; border: 1px solid rgba(255,255,255,.1); background: rgba(9,9,11,.9); color: #fafafa; font-size: 15px; outline: none; }}
+      input:focus {{ border-color: rgba(250,250,250,.35); box-shadow: 0 0 0 3px rgba(250,250,250,.08); }}
+      button {{ width: 100%; margin-top: 16px; padding: 12px 14px; border: 0; border-radius: 12px; background: #fafafa; color: #09090b; font-size: 14px; font-weight: 700; cursor: pointer; }}
+      button:hover {{ opacity: .94; }}
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <div class="eyebrow">Hermes Agent</div>
+      <h1>Unlock WebUI</h1>
+      <p>Enter the dashboard password to continue.</p>
+      {error_block}
+      <form method="post" action="/login">
+        <input type="hidden" name="next" value="{safe_next}" />
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" autofocus required />
+        <button type="submit">Log in</button>
+      </form>
+    </main>
+  </body>
+</html>""",
+        status_code=status_code,
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+    )
+
+
+def _cookie_should_be_secure(request: Request) -> bool:
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip().lower()
+    scheme = getattr(request.url, "scheme", "").lower()
+    return forwarded_proto == "https" or scheme == "https"
+
+
+@app.get("/login")
+async def login_page(request: Request):
+    next_path = _safe_redirect_target(request.query_params.get("next", "/"))
+    if not _webui_auth_enabled() or _is_webui_authenticated(request):
+        return RedirectResponse(url=next_path, status_code=303)
+    return _login_page(next_path)
+
+
+@app.post("/login")
+async def login_submit(request: Request):
+    if not _webui_auth_enabled():
+        return RedirectResponse(url="/", status_code=303)
+    body = (await request.body()).decode("utf-8", errors="replace")
+    form = urllib.parse.parse_qs(body, keep_blank_values=True)
+    next_path = _safe_redirect_target(form.get("next", ["/"])[0])
+    password = form.get("password", [""])[0]
+    if not password or not hmac.compare_digest(password, _webui_password()):
+        return _login_page(next_path, error="Invalid password", status_code=401)
+    response = RedirectResponse(url=next_path, status_code=303)
+    response.set_cookie(
+        _WEBUI_AUTH_COOKIE,
+        _make_webui_session(password),
+        max_age=_WEBUI_AUTH_TTL_SECONDS,
+        httponly=True,
+        samesite="lax",
+        secure=_cookie_should_be_secure(request),
+        path="/",
+    )
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    return response
+
+
+@app.get("/logout")
+async def logout(request: Request):
+    target = "/login" if _webui_auth_enabled() else "/"
+    response = RedirectResponse(url=target, status_code=303)
+    response.delete_cookie(_WEBUI_AUTH_COOKIE, path="/")
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    return response
 
 
 def _require_token(request: Request) -> None:
@@ -117,8 +323,15 @@ def _require_token(request: Request) -> None:
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    """Require the session token on all /api/ routes except the public list."""
     path = request.url.path
+    if _webui_auth_enabled():
+        if path == "/login":
+            if _is_webui_authenticated(request):
+                target = _safe_redirect_target(request.query_params.get("next", "/"))
+                return RedirectResponse(url=target, status_code=303)
+            return await call_next(request)
+        if path != "/logout" and not _is_webui_authenticated(request):
+            return _login_required_response(request)
     if path.startswith("/api/") and path not in _PUBLIC_API_PATHS and not path.startswith("/api/plugins/"):
         auth = request.headers.get("authorization", "")
         expected = f"Bearer {_SESSION_TOKEN}"
@@ -2023,10 +2236,10 @@ def mount_spa(application: FastAPI):
     _index_path = WEB_DIST / "index.html"
 
     def _serve_index():
-        """Return index.html with the session token injected."""
         html = _index_path.read_text()
         token_script = (
-            f'<script>window.__HERMES_SESSION_TOKEN__="{_SESSION_TOKEN}";</script>'
+            f'<script>window.__HERMES_SESSION_TOKEN__="{_SESSION_TOKEN}";'
+            f'window.__HERMES_WEBUI_AUTH_ENABLED__={str(_webui_auth_enabled()).lower()};</script>'
         )
         html = html.replace("</head>", f"{token_script}</head>", 1)
         return HTMLResponse(

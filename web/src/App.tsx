@@ -3,7 +3,7 @@ import { Routes, Route, NavLink, Navigate } from "react-router-dom";
 import {
   Activity, BarChart3, Clock, FileText, KeyRound,
   MessageSquare, Package, Settings, Puzzle,
-  Sparkles, Terminal, Globe, Database, Shield,
+  Sparkles, Terminal, Globe, Database, Shield, LogOut,
   Wrench, Zap, Heart, Star, Code, Eye,
 } from "lucide-react";
 import StatusPage from "@/pages/StatusPage";
@@ -17,6 +17,7 @@ import SkillsPage from "@/pages/SkillsPage";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { ThemeSwitcher } from "@/components/ThemeSwitcher";
 import { useI18n } from "@/i18n";
+import { isWebUiAuthEnabled } from "@/lib/api";
 import { usePlugins } from "@/plugins";
 import type { RegisteredPlugin } from "@/plugins";
 
@@ -96,6 +97,7 @@ function buildNavItems(builtIn: NavItem[], plugins: RegisteredPlugin[]): NavItem
 export default function App() {
   const { t } = useI18n();
   const { plugins } = usePlugins();
+  const authEnabled = isWebUiAuthEnabled();
 
   const navItems = useMemo(
     () => buildNavItems(BUILTIN_NAV, plugins),
@@ -146,6 +148,15 @@ export default function App() {
           </nav>
 
           <div className="ml-auto flex items-center gap-2 px-2 sm:px-4">
+            {authEnabled && (
+              <a
+                href="/logout"
+                className="inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 text-[0.65rem] font-display uppercase tracking-[0.14em] text-muted-foreground transition-colors hover:text-foreground hover:bg-muted/40"
+              >
+                <LogOut className="h-3.5 w-3.5" />
+                <span className="hidden sm:inline">Logout</span>
+              </a>
+            )}
             <ThemeSwitcher />
             <LanguageSwitcher />
             <span className="hidden sm:inline font-display text-[0.7rem] tracking-[0.15em] uppercase opacity-50">

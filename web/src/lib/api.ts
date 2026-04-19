@@ -5,9 +5,20 @@ const BASE = "";
 declare global {
   interface Window {
     __HERMES_SESSION_TOKEN__?: string;
+    __HERMES_WEBUI_AUTH_ENABLED__?: boolean;
   }
 }
 let _sessionToken: string | null = null;
+
+export function isWebUiAuthEnabled(): boolean {
+  return typeof window !== "undefined" && !!window.__HERMES_WEBUI_AUTH_ENABLED__;
+}
+
+function redirectToLogin(): void {
+  if (typeof window === "undefined") return;
+  const next = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+  window.location.assign(`/login?next=${encodeURIComponent(next || "/")}`);
+}
 
 export async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> {
   // Inject the session token into all /api/ requests.
@@ -18,6 +29,9 @@ export async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> 
   }
   const res = await fetch(`${BASE}${url}`, { ...init, headers });
   if (!res.ok) {
+    if (res.status === 401 && isWebUiAuthEnabled()) {
+      redirectToLogin();
+    }
     const text = await res.text().catch(() => res.statusText);
     throw new Error(`${res.status}: ${text}`);
   }

@@ -290,6 +290,87 @@ class TestWebServerEndpoints:
         resp = unauth_client.get("/api/status")
         assert resp.status_code == 200
 
+    def test_webui_password_redirects_root_to_login(self, monkeypatch):
+        from starlette.testclient import TestClient
+        from hermes_cli.web_server import app
+
+        monkeypatch.setenv("HERMES_WEBUI_PASSWORD", "secret-login-pass")
+        client = TestClient(app)
+
+        resp = client.get("/", follow_redirects=False)
+        assert resp.status_code == 303
+        assert resp.headers["location"].startswith("/login?next=%2F")
+
+        login_page = client.get("/login")
+        assert login_page.status_code == 200
+        assert "Unlock WebUI" in login_page.text
+        assert "__HERMES_SESSION_TOKEN__" not in login_page.text
+
+    def test_webui_password_blocks_public_dashboard_api_until_login(self, monkeypatch):
+        from starlette.testclient import TestClient
+        from hermes_cli.web_server import app
+
+        monkeypatch.setenv("HERMES_WEBUI_PASSWORD", "secret-login-pass")
+        client = TestClient(app)
+
+        resp = client.get("/api/status")
+        assert resp.status_code == 401
+        assert resp.json()["detail"] == "Login required"
+
+    def test_webui_password_login_logout_and_token_layer(self, monkeypatch):
+        from starlette.testclient import TestClient
+        from hermes_cli.web_server import app, _SESSION_TOKEN
+
+        monkeypatch.setenv("HERMES_WEBUI_PASSWORD", "secret-login-pass")
+        client = TestClient(app)
+
+        bad = client.post(
+            "/login",
+            data={"password": "wrong-pass", "next": "/env"},
+            follow_redirects=False,
+        )
+        assert bad.status_code == 401
+        assert "set-cookie" not in {k.lower(): v for k, v in bad.headers.items()}
+
+        good = client.post(
+            "/login",
+            data={"password": "secret-login-pass", "next": "/env"},
+            follow_redirects=False,
+        )
+        assert good.status_code == 303
+        assert good.headers["location"] == "/env"
+        assert "hermes_webui_session=" in good.headers.get("set-cookie", "")
+
+        assert client.get("/api/status").status_code == 200
+        assert client.get("/api/env").status_code == 401
+
+        client.headers["Authorization"] = f"Bearer {_SESSION_TOKEN}"
+        assert client.get("/api/env").status_code == 200
+
+        logout = client.get("/logout", follow_redirects=False)
+        assert logout.status_code == 303
+        assert logout.headers["location"] == "/login"
+        assert client.get("/api/status").status_code == 401
+
+    def test_webui_password_change_invalidates_existing_cookie(self, monkeypatch):
+        from starlette.testclient import TestClient
+        from hermes_cli.web_server import app
+
+        monkeypatch.setenv("HERMES_WEBUI_PASSWORD", "secret-login-pass")
+        client = TestClient(app)
+
+        login = client.post(
+            "/login",
+            data={"password": "secret-login-pass", "next": "/"},
+            follow_redirects=False,
+        )
+        assert login.status_code == 303
+
+        monkeypatch.setenv("HERMES_WEBUI_PASSWORD", "new-secret-pass")
+        resp = client.get("/", follow_redirects=False)
+        assert resp.status_code == 303
+        assert resp.headers["location"].startswith("/login?next=%2F")
+
     def test_path_traversal_blocked(self):
         """Verify URL-encoded path traversal is blocked."""
         # %2e%2e = ..

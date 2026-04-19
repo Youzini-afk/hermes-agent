@@ -1603,6 +1603,13 @@ OPTIONAL_ENV_VARS = {
         "category": "messaging",
         "advanced": True,
     },
+    "HERMES_WEBUI_PASSWORD": {
+        "description": "Optional password required before the dashboard WebUI can be opened. When set, users must log in before the SPA and dashboard APIs are available.",
+        "prompt": "WebUI login password",
+        "url": None,
+        "password": True,
+        "category": "setting",
+    },
     "API_SERVER_PORT": {
         "description": "Port for the API server (default: 8642).",
         "prompt": "API server port",
