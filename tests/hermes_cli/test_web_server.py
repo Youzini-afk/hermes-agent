@@ -108,9 +108,18 @@ class TestWebServerEndpoints:
         except ImportError:
             pytest.skip("fastapi/starlette not installed")
 
-        from hermes_cli.web_server import app, _SESSION_TOKEN
-        self.client = TestClient(app)
-        self.client.headers["Authorization"] = f"Bearer {_SESSION_TOKEN}"
+        import hermes_cli.web_server as web_server
+
+        with web_server._login_failure_lock:
+            web_server._login_failure_buckets.clear()
+
+        self.client = TestClient(web_server.app)
+        self.client.headers["Authorization"] = f"Bearer {web_server._SESSION_TOKEN}"
+
+        yield
+
+        with web_server._login_failure_lock:
+            web_server._login_failure_buckets.clear()
 
     def test_get_status(self):
         resp = self.client.get("/api/status")
@@ -370,6 +379,90 @@ class TestWebServerEndpoints:
         resp = client.get("/", follow_redirects=False)
         assert resp.status_code == 303
         assert resp.headers["location"].startswith("/login?next=%2F")
+
+    def test_webui_password_rate_limits_repeated_failures(self, monkeypatch):
+        from starlette.testclient import TestClient
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setenv("HERMES_WEBUI_PASSWORD", "secret-login-pass")
+        now = {"value": 1_700_000_000.0}
+        monkeypatch.setattr(web_server.time, "time", lambda: now["value"])
+        client = TestClient(web_server.app)
+        headers = {"X-Forwarded-For": "203.0.113.10"}
+
+        for _ in range(web_server._LOGIN_FAILURE_MAX_ATTEMPTS - 1):
+            resp = client.post(
+                "/login",
+                data={"password": "wrong-pass", "next": "/env"},
+                headers=headers,
+                follow_redirects=False,
+            )
+            assert resp.status_code == 401
+            assert resp.headers.get("Retry-After") is None
+
+        locked = client.post(
+            "/login",
+            data={"password": "wrong-pass", "next": "/env"},
+            headers=headers,
+            follow_redirects=False,
+        )
+        assert locked.status_code == 429
+        assert locked.headers["Retry-After"] == str(web_server._LOGIN_LOCKOUT_SECONDS)
+        assert "Too many failed attempts" in locked.text
+
+        blocked_good = client.post(
+            "/login",
+            data={"password": "secret-login-pass", "next": "/env"},
+            headers=headers,
+            follow_redirects=False,
+        )
+        assert blocked_good.status_code == 429
+
+        now["value"] += web_server._LOGIN_LOCKOUT_SECONDS + 1
+        recovered = client.post(
+            "/login",
+            data={"password": "secret-login-pass", "next": "/env"},
+            headers=headers,
+            follow_redirects=False,
+        )
+        assert recovered.status_code == 303
+        assert recovered.headers["location"] == "/env"
+
+    def test_webui_password_success_clears_failure_counter(self, monkeypatch):
+        from starlette.testclient import TestClient
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setenv("HERMES_WEBUI_PASSWORD", "secret-login-pass")
+        client = TestClient(web_server.app)
+        headers = {"X-Forwarded-For": "198.51.100.7"}
+
+        for _ in range(web_server._LOGIN_FAILURE_MAX_ATTEMPTS - 1):
+            resp = client.post(
+                "/login",
+                data={"password": "wrong-pass", "next": "/"},
+                headers=headers,
+                follow_redirects=False,
+            )
+            assert resp.status_code == 401
+
+        good = client.post(
+            "/login",
+            data={"password": "secret-login-pass", "next": "/"},
+            headers=headers,
+            follow_redirects=False,
+        )
+        assert good.status_code == 303
+
+        client.cookies.clear()
+
+        after_reset = client.post(
+            "/login",
+            data={"password": "wrong-pass", "next": "/"},
+            headers=headers,
+            follow_redirects=False,
+        )
+        assert after_reset.status_code == 401
+        assert after_reset.headers.get("Retry-After") is None
 
     def test_path_traversal_blocked(self):
         """Verify URL-encoded path traversal is blocked."""

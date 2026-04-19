@@ -77,6 +77,11 @@ _SESSION_TOKEN = secrets.token_urlsafe(32)
 _WEBUI_AUTH_COOKIE = "hermes_webui_session"
 _WEBUI_AUTH_TTL_SECONDS = 60 * 60 * 12
 _WEBUI_AUTH_SIGNING_KEY = secrets.token_bytes(32)
+_LOGIN_FAILURE_MAX_ATTEMPTS = 5
+_LOGIN_FAILURE_WINDOW_SECONDS = 60 * 10
+_LOGIN_LOCKOUT_SECONDS = 60 * 15
+_login_failure_buckets: Dict[str, Dict[str, Any]] = {}
+_login_failure_lock = threading.Lock()
 
 # Simple rate limiter for the reveal endpoint
 _reveal_timestamps: List[float] = []
@@ -124,6 +129,86 @@ def _webui_auth_enabled() -> bool:
 
 def _password_fingerprint(password: str) -> str:
     return hashlib.sha256(password.encode("utf-8")).hexdigest()[:16]
+
+
+def _login_client_key(request: Request) -> str:
+    forwarded_for = request.headers.get("x-forwarded-for", "")
+    if forwarded_for:
+        candidate = forwarded_for.split(",", 1)[0].strip().lower()
+        if candidate:
+            return f"ip:{candidate}"
+
+    real_ip = request.headers.get("x-real-ip", "").strip().lower()
+    if real_ip:
+        return f"ip:{real_ip}"
+
+    host = (request.client.host if request.client and request.client.host else "").strip().lower()
+    if host and host not in {"127.0.0.1", "::1", "localhost"}:
+        return f"ip:{host}"
+
+    user_agent = request.headers.get("user-agent", "").strip()
+    if user_agent:
+        fingerprint = hashlib.sha256(user_agent.encode("utf-8")).hexdigest()[:16]
+        return f"local:{host or 'unknown'}:{fingerprint}"
+
+    return f"local:{host or 'unknown'}"
+
+
+def _login_retry_after_seconds(client_key: str, now: Optional[float] = None) -> int:
+    current = time.time() if now is None else now
+    with _login_failure_lock:
+        state = _login_failure_buckets.get(client_key)
+        if not state:
+            return 0
+
+        blocked_until = float(state.get("blocked_until", 0.0))
+        if blocked_until > current:
+            return max(1, int((blocked_until - current) + 0.999))
+        if blocked_until:
+            _login_failure_buckets.pop(client_key, None)
+            return 0
+
+        failures = [
+            float(ts)
+            for ts in state.get("failures", [])
+            if isinstance(ts, (int, float)) and current - float(ts) < _LOGIN_FAILURE_WINDOW_SECONDS
+        ]
+        if failures:
+            _login_failure_buckets[client_key] = {"failures": failures, "blocked_until": 0.0}
+        else:
+            _login_failure_buckets.pop(client_key, None)
+        return 0
+
+
+def _record_login_failure(client_key: str, now: Optional[float] = None) -> int:
+    current = time.time() if now is None else now
+    with _login_failure_lock:
+        state = _login_failure_buckets.get(client_key, {})
+        blocked_until = float(state.get("blocked_until", 0.0))
+        if blocked_until > current:
+            return max(1, int((blocked_until - current) + 0.999))
+
+        failures = [
+            float(ts)
+            for ts in state.get("failures", [])
+            if isinstance(ts, (int, float)) and current - float(ts) < _LOGIN_FAILURE_WINDOW_SECONDS
+        ]
+        failures.append(current)
+
+        if len(failures) >= _LOGIN_FAILURE_MAX_ATTEMPTS:
+            _login_failure_buckets[client_key] = {
+                "failures": [],
+                "blocked_until": current + _LOGIN_LOCKOUT_SECONDS,
+            }
+            return _LOGIN_LOCKOUT_SECONDS
+
+        _login_failure_buckets[client_key] = {"failures": failures, "blocked_until": 0.0}
+        return 0
+
+
+def _clear_login_failures(client_key: str) -> None:
+    with _login_failure_lock:
+        _login_failure_buckets.pop(client_key, None)
 
 
 def _safe_redirect_target(raw: str) -> str:
@@ -263,6 +348,18 @@ def _login_page(next_path: str, error: str = "", status_code: int = 200) -> HTML
     )
 
 
+def _login_rate_limited_response(next_path: str, retry_after_seconds: int) -> HTMLResponse:
+    minutes = max(1, (retry_after_seconds + 59) // 60)
+    suffix = "" if minutes == 1 else "s"
+    response = _login_page(
+        next_path,
+        error=f"Too many failed attempts. Try again in about {minutes} minute{suffix}.",
+        status_code=429,
+    )
+    response.headers["Retry-After"] = str(max(1, retry_after_seconds))
+    return response
+
+
 def _cookie_should_be_secure(request: Request) -> bool:
     forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip().lower()
     scheme = getattr(request.url, "scheme", "").lower()
@@ -284,9 +381,17 @@ async def login_submit(request: Request):
     body = (await request.body()).decode("utf-8", errors="replace")
     form = urllib.parse.parse_qs(body, keep_blank_values=True)
     next_path = _safe_redirect_target(form.get("next", ["/"])[0])
+    client_key = _login_client_key(request)
+    retry_after = _login_retry_after_seconds(client_key)
+    if retry_after > 0:
+        return _login_rate_limited_response(next_path, retry_after)
     password = form.get("password", [""])[0]
     if not password or not hmac.compare_digest(password, _webui_password()):
+        retry_after = _record_login_failure(client_key)
+        if retry_after > 0:
+            return _login_rate_limited_response(next_path, retry_after)
         return _login_page(next_path, error="Invalid password", status_code=401)
+    _clear_login_failures(client_key)
     response = RedirectResponse(url=next_path, status_code=303)
     response.set_cookie(
         _WEBUI_AUTH_COOKIE,
