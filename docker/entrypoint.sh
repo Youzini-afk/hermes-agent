@@ -68,4 +68,15 @@ if [ -d "$INSTALL_DIR/skills" ]; then
     python3 "$INSTALL_DIR/tools/skills_sync.py"
 fi
 
+if [ "${1:-}" = "hermes" ]; then
+    shift
+fi
+
+if [ "$#" -eq 0 ]; then
+    if [ "${HERMES_DEPLOY_TARGET:-}" = "zeabur" ] || [ -n "${ZEABUR_WEB_URL:-}" ]; then
+        echo "No startup command provided for Zeabur runtime; defaulting to: gateway run"
+        set -- gateway run
+    fi
+fi
+
 exec hermes "$@"
