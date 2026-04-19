@@ -294,10 +294,20 @@ def _is_same_origin_request(request, origin: str) -> bool:
     return hmac.compare_digest(candidate.encode("utf-8"), expected.encode("utf-8"))
 
 
+def _cors_protected_path(path: str) -> bool:
+    return (
+        path in {"/health", "/health/detailed", "/v1/health", "/api/jobs"}
+        or path.startswith("/v1/")
+        or path.startswith("/api/jobs/")
+    )
+
+
 if AIOHTTP_AVAILABLE:
     @web.middleware
     async def cors_middleware(request, handler):
         """Add CORS headers for explicitly allowed origins; handle OPTIONS preflight."""
+        if not _cors_protected_path(request.path):
+            return await handler(request)
         adapter = request.app.get("api_server_adapter")
         origin = request.headers.get("Origin", "")
         cors_headers = None

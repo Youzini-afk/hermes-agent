@@ -1918,7 +1918,7 @@ class TestDashboardProxyRoutes:
 
         adapter = APIServerAdapter(PlatformConfig(enabled=True))
 
-        proxied = {}
+        proxied = []
 
         class _FakeSocket:
             def __enter__(self):
@@ -1940,9 +1940,10 @@ class TestDashboardProxyRoutes:
                 return None
 
         class _FakeProxyResponse:
-            def __init__(self):
-                self.status = 303
-                self.headers = {"Location": "/"}
+            def __init__(self, status, headers=None, body=b""):
+                self.status = status
+                self.headers = headers or {}
+                self._body = body
 
             async def __aenter__(self):
                 return self
@@ -1951,7 +1952,7 @@ class TestDashboardProxyRoutes:
                 return False
 
             async def read(self):
-                return b""
+                return self._body
 
         class _FakeClientSession:
             def __init__(self, *args, **kwargs):
@@ -1964,14 +1965,18 @@ class TestDashboardProxyRoutes:
                 return False
 
             def request(self, method, url, data=None, headers=None, allow_redirects=False):
-                proxied.update({
+                proxied.append({
                     "method": method,
                     "url": url,
                     "data": data,
                     "headers": headers,
                     "allow_redirects": allow_redirects,
                 })
-                return _FakeProxyResponse()
+                if url.endswith("/login"):
+                    return _FakeProxyResponse(303, {"Location": "/"})
+                if url.endswith("/api/status"):
+                    return _FakeProxyResponse(200, {"Content-Type": "application/json"}, b'{"status":"ok"}')
+                raise AssertionError(f"unexpected proxy url: {url}")
 
         def _fake_start_dashboard_sidecar() -> bool:
             adapter._dashboard_sidecar = _FakeSidecarHandle()
@@ -1990,16 +1995,24 @@ class TestDashboardProxyRoutes:
         ):
             assert await adapter.connect() is True
             async with TestClient(TestServer(adapter._app)) as cli:
-                resp = await cli.post(
+                login_resp = await cli.post(
                     "/login",
                     data={"password": "secret-login-pass", "next": "/"},
-                    headers={"Origin": "https://hermes.example"},
+                    headers={"Origin": "https://unexpected.example"},
                     allow_redirects=False,
                 )
-                assert resp.status == 303
-                assert proxied["method"] == "POST"
-                assert proxied["url"] == "http://127.0.0.1:9456/login"
-                assert proxied["allow_redirects"] is False
+                assert login_resp.status == 303
+                dashboard_resp = await cli.get(
+                    "/api/status",
+                    headers={"Origin": "https://unexpected.example"},
+                )
+                assert dashboard_resp.status == 200
+                assert await dashboard_resp.text() == '{"status":"ok"}'
+                assert proxied[0]["method"] == "POST"
+                assert proxied[0]["url"] == "http://127.0.0.1:9456/login"
+                assert proxied[0]["allow_redirects"] is False
+                assert proxied[1]["method"] == "GET"
+                assert proxied[1]["url"] == "http://127.0.0.1:9456/api/status"
             await adapter.disconnect()
 
 
