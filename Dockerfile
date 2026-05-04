@@ -99,3 +99,4 @@ ENV PATH="/opt/data/.local/bin:${PATH}"
 EXPOSE 8787
 VOLUME [ "/opt/data" ]
 ENTRYPOINT [ "/usr/bin/tini", "-g", "--", "/opt/hermes/docker/entrypoint.sh" ]
+CMD [ "webui" ]

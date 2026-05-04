@@ -13,8 +13,10 @@ Configure:
 
 - **Port:** `8787`
 - **Volume:** mount persistent storage at `/opt/data`
-- **Start command:** `webui`
-  - Alternative: leave the command empty and set `HERMES_WEBUI=1`.
+- **Start command:** leave empty, or explicitly set `webui`.
+  - The image default command is `webui`, so Zeabur deployments still start the
+    WebUI when the platform command field is blank.
+  - Alternative: set `HERMES_WEBUI=1`.
 
 Do not mount volumes over `/opt/hermes` or `/opt/hermes-webui`. Those paths are
 image source directories: `/opt/hermes` contains the agent source and virtualenv,
