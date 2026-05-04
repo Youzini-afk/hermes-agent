@@ -86,6 +86,21 @@ if [ -d "$INSTALL_DIR/skills" ]; then
     python3 "$INSTALL_DIR/tools/skills_sync.py"
 fi
 
+if [ $# -eq 0 ]; then
+    case "${HERMES_WEBUI:-}" in
+        1|true|TRUE|True|yes|YES|Yes)
+            set -- webui
+            ;;
+    esac
+fi
+
+case "${1:-}" in
+    webui|hermes-webui)
+        shift
+        exec "$INSTALL_DIR/docker/webui-entrypoint.sh" "$@"
+        ;;
+esac
+
 # Optionally start `hermes dashboard` as a side-process.
 #
 # Toggled by HERMES_DASHBOARD=1 (also accepts "true"/"yes", case-insensitive).

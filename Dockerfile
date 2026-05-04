@@ -2,6 +2,9 @@ FROM ghcr.io/astral-sh/uv:0.11.6-python3.13-trixie@sha256:b3c543b6c4f23a5f2df228
 FROM tianon/gosu:1.19-trixie@sha256:3b176695959c71e123eb390d427efc665eeb561b1540e82679c15e992006b8b9 AS gosu_source
 FROM debian:13.4
 
+ARG HERMES_WEBUI_REPO=https://github.com/Youzini-afk/hermes-webui.git
+ARG HERMES_WEBUI_REF=9986d2fd30810045d0d02abff3e264c0be802bae
+
 # Disable Python stdout buffering to ensure logs are printed immediately
 ENV PYTHONUNBUFFERED=1
 
@@ -75,9 +78,24 @@ RUN chmod -R a+rX /opt/hermes
 RUN uv venv && \
     uv pip install --no-cache-dir -e ".[all]"
 
+# ---------- Hermes WebUI ----------
+RUN git clone "$HERMES_WEBUI_REPO" /opt/hermes-webui && \
+    cd /opt/hermes-webui && \
+    git checkout "$HERMES_WEBUI_REF" && \
+    rm -rf .git && \
+    uv pip install --no-cache-dir --python /opt/hermes/.venv/bin/python -r requirements.txt "hindsight-client==0.4.22" && \
+    chmod 0755 /opt/hermes/docker/webui-entrypoint.sh && \
+    chmod -R a+rX /opt/hermes-webui
+
 # ---------- Runtime ----------
 ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
 ENV HERMES_HOME=/opt/data
+ENV HERMES_WEBUI_AGENT_DIR=/opt/hermes
+ENV HERMES_WEBUI_PYTHON=/opt/hermes/.venv/bin/python
+ENV HERMES_WEBUI_STATE_DIR=/opt/data/webui
+ENV HERMES_WEBUI_DEFAULT_WORKSPACE=/opt/data/workspace
+ENV HERMES_WEBUI_HOST=0.0.0.0
 ENV PATH="/opt/data/.local/bin:${PATH}"
+EXPOSE 8787
 VOLUME [ "/opt/data" ]
 ENTRYPOINT [ "/usr/bin/tini", "-g", "--", "/opt/hermes/docker/entrypoint.sh" ]
